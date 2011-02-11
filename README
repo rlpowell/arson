@@ -1,0 +1,108 @@
+Arson is a gateway between 37signals' Campfire (
+http://campfirenow.com/ ) and your own Jabber server, where campfire
+rooms appear as MUC (multi-user chat) rooms.
+
+Optionally, you can then use bitlbee and an IRC client to get all
+your campfire in your IRC client.
+
+Various bits of this were taken from various tutorials around the
+web, but no more than a line or two from any of them has been left
+untouched, so everything in here is Public Domain.
+
+Arson will almost certainly be updated exactly enough to meet my
+needs, and no further; feel free to send a pull request if you want
+to add a feature.
+
+Arson is written in Ruby.
+
+          Requirements
+          ------------
+
+Gems
+----
+
+
+Other
+-----
+
+To follow the instructions below to the letter, you will need an
+ejabberd instance on localhost.  Otherwise, configuring the campfire
+component on your jabber server is up to you.
+
+          Instructions
+          ------------
+
+Basic Setup
+-----------
+
+Stick arson.rb and ArsonConfig.rb in a directory somewhere.
+
+Modify ArsonConfig.rb to your liking; there are instructions in the
+comments there.  It's Ruby code, so be mindful of the syntax.
+FIXME: Config Instructions here?
+
+ejabberd Setup
+--------------
+
+Install ejabberd on the host you'll be running arson on.
+
+Add the following to your ejabberd.cfg, in the same place as the
+example ejabberd_service that should already be there (in the
+"listen" section):
+
+- ------------------------------------
+
+  {5347, ejabberd_service, [
+                            {access, all},
+                            {hosts, ["campfire.localhost"],
+                                    [{password, "campfirepass"}]
+                            }
+                            ]},
+
+- ------------------------------------
+
+Also make sure the lists of "hosts" includes "localhost".
+
+Then restart the server ("sudo ejabberdctl restart", probably).
+
+Execution
+---------
+
+It uses the Daemon gem, so it pretends to act like a normal UNIX
+daemon.
+
+Running "ruby arson.rb" will give you the execution options.
+
+Start with:     ruby arson.rb start
+Stop  with:     ruby arson.rb stop
+
+
+          bitlbee/IRC Instructions
+          ------------------------
+
+Get bitlbee installed and running.  Make an account for you on
+ejabberd like so:
+
+  sudo ejabberdctl register USERNAME localhost PASSWORD
+
+Old bitlbee (1.2.3 or so)
+-------------------------
+
+Create the account in bitlbee:
+
+  account add jabber USERNAME@localhost PASSWORD
+
+Start it up:
+
+  account list
+  account [account number] on
+
+Join each room; this uses the jabber room name from the config file:
+
+  join_chat [account number] [jabber room name]@conference.localhost
+
+New bitlbee FIXmE: ???
+-------------------------
+
+FIXME
+
