@@ -101,8 +101,21 @@ Join each room; this uses the jabber room name from the config file:
 
   join_chat [account number] [jabber room name]@conference.localhost
 
-New bitlbee FIXmE: ???
--------------------------
+New bitlbee (3.0 or so)
+-----------------------
 
-FIXME
+bitlbee 3.0 is better because it doesn't screw up the capitalization.
 
+Create the account in bitlbee:
+
+  account add jabber rpowell2@localhost password
+
+Start it up:
+
+  account 0 on
+
+Join each room; this uses the jabber room name from the config file:
+
+  chat add 0 cjh2_test_chat@conference.localhost
+
+FIXME: TODO: Option to drop last names and shit from CF.
