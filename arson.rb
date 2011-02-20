@@ -5,25 +5,40 @@
 # We create a jabber component, campfire.localhost or similar, use it
 # to create a MUC for each campfire room, and also use it to create
 # virtual users to join the MUCs, one for each campfire user.
+#
+# The component does this by having callbacks for, and responding
+# appropriately to, arbirtary presence and message stanza that come in
+# to its component name; see
+# http://xmpp.org/extensions/xep-0045.html for details of the MUC
+# messages.
 # 
-# Every Jabber MUC has a master user (called "virt_campfire") in it, with
-# a callback.  When a message is generated on the Jabber end, the
-# callback checks to see if it came from any of the virtual users we
-# created.  If it doesn't, we use the name that it came in on to find
-# a Campfire user name to send it out as.
+# When a message from a real user comes in on the Jabber end, we use
+# the name that it came in on to find a Campfire user name to send it
+# out as.
+#
+# Note that each virtual MUC and associated set of virtual users is
+# per-real-user; no real user can see or connect to any other real
+# user's jabber/campfire rooms on the component, since they don't
+# "actually exist"; the component just responds as though there are
+# a bunch of MUCs and users.
 # 
-# FIXME: this means we should allow multiple campfire users.
-# 
+# It is worth noting that xmpp4r is not actually prepared to be a
+# component supporting a bunch of virtual MUCs and users, at all, so
+# we have to manually construct our own presence messages in a lot of
+# cases.
+#
 # The Campfire End:
 # 
-# We log in to Campfire with the token(FIXME: s).  Then we make a
-# thread for each room, and stream messages in that thread.  Any kick
-# or leave or join message causes the list of MUC virtual users to get
-# re-evaluated.  Any actual message gets passed to the Jabber room.
+# For each user, we log in to Campfire with their token.  Then we make
+# a thread for each room, and stream messages in that thread.  Any
+# kick or leave or join message causes the list of MUC virtual users
+# to get re-evaluated.  Any actual message gets passed to the Jabber
+# room, with some special handling for things like pastes and uploads.
 # 
 # We also launch another thread that simply re-asserts each token's
 # presence in each room every minute, because Campfire has this
-# annoying habit of losing track.
+# annoying habit of losing track.  It also checks nicks, for similar
+# reasons.
 
 
 require 'rubygems'
@@ -39,21 +54,22 @@ require 'xmpp4r/roster'
 require 'yaml'
 require 'ArsonConfig'
 
+
+#**************************************************
+# Globals
+#**************************************************
 $jabber_component = nil
+$log = nil
+$users = nil
 
-$log = Logger.new(STDERR)
+#**************************************************
+# Support Functions
+#
+# If you're looking for the main program flow, search for "Daemons"
+#**************************************************
 
-$rooms = ArsonConfig::Rooms
-$log.debug( "Config load: Rooms: #{YAML::dump($rooms)}" )
-
-$users = Array.new
-
-ArsonConfig::Configs.each do |configfile|
-  $users.push( YAML.load_file(configfile) )
-end
-
-$log.debug( "Config load: Users: #{YAML::dump($users)}" )
-
+# This code is making up for the fact that xmpp4r doesn't know how
+# to generate the presence stanzas we need in any clean fashion.
 def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason=nil, status_codes=nil )
   $log.debug( "In send_presence: #{from}, #{to}, #{type}, #{xmuc}, #{affiliation}, #{role}, #{reason}, #{status_codes}" )
   presence = Jabber::Presence.new.set_from( from )
@@ -61,52 +77,28 @@ def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason
 
   if xmuc
     xelem = presence.add_element('x', { 'xmlns' => 'http://jabber.org/protocol/muc#user' } )
-    print "presence: #{YAML::dump(presence)}\n"
+    #print "presence: #{YAML::dump(presence)}\n"
 
     if affiliation and role
       itemelem = xelem.add_element( 'item', { 'affiliation' => affiliation, 'role' => role } )
       if reason
         itemelem.add_element( 'reason' ).add_text( reason )
       end
-      print "presence: #{YAML::dump(presence)}\n"
+      #print "presence: #{YAML::dump(presence)}\n"
     end
 
     if status_codes
       status_codes.each do |code|
         xelem.add_element( 'status', { 'code' => code } )
       end
-      print "presence: #{YAML::dump(presence)}\n"
+      #print "presence: #{YAML::dump(presence)}\n"
     end
 
     $jabber_component.send(presence)
   end
 end
 
-# Drop all the virtual users when we exit
-at_exit do
-  $users.each do |user|
-    user['rooms'].each do |room|
-
-      room_jid=nil
-      if room.has_key?('room_jid')
-        room_jid=room['room_jid']
-      else
-        room_jid="#{room['campfire_room_name']}@#{ArsonConfig::JabberComponentName}"
-      end
-
-      user_jid=nil
-      if room.has_key?('user_jid')
-        user_jid=room['user_jid']
-      else
-        user_jid=user['jabber_id']
-      end
-
-      send_presence( room_jid, user_jid, :unavailable, true, 'none', 'none', 'Campfire server shutting down.', [ '307' ] )
-    end
-  end
-end
-
-# function fix_nicks(room)
+# Updates the list of nicks in a virtual Jabber room.
 #
 # First we grab all the users in the room
 #
@@ -118,6 +110,10 @@ end
 #
 # There's certainly better ways to do that (like set substraction),
 # but we're talking about very small lists so enh.
+#
+# The "realuser" argument is the full user structure for the user in
+# question; it's used by make_muc_user to find out what sorts of name
+# layouts the user prefers.
 #
 def fix_nicks( room, realuser )
   campfire_room = room['campfire_room']
@@ -143,6 +139,8 @@ def fix_nicks( room, realuser )
   end
 end
 
+# Takes a Campfire name and turns it into the jabber nick
+# appropriate for the room in question.
 def name_to_jabber_nick( name, room )
   usename = name
   if room['jabber_users'].has_key?( name )
@@ -165,6 +163,7 @@ def name_firstni( name )
   return name.split[0]+" "+name.split[1][0,1]
 end
 
+# Returns the name format of the user preference type given.
 def preferred_name( type, name )
   $log.debug( "In preferred_name; type #{type}, name #{name}" )
   case type
@@ -180,34 +179,37 @@ def preferred_name( type, name )
   end
 end
 
+# Check whether a given name already exists in a given room
 def check_name_conflict( name, room )
-  $log.debug( "In check_name_conflict, name #{name}, room names #{YAML::dump(room['jabber_users'])}" )
+  $log.debug( "In check_name_conflict, name #{name}, room names #{room['jabber_users']}" )
+  #$log.debug( "In check_name_conflict, name #{name}, room names #{YAML::dump(room['jabber_users'])}" )
   conflict = false
   conflict = room['jabber_users'].keys.detect { |fullname| room['jabber_users'][fullname] == name }
   $log.debug( "In check_name_conflict, returning #{conflict}" )
   return conflict
 end
 
-
+# utility function for make_muc_user; does the actual presence
+# generaton
 def make_muc_user_final( room, usename )
-  from = "#{room['campfire_room_name']}@#{ArsonConfig::JabberComponentName}/#{slugify_name(usename)}"
+  from = "#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}/#{slugify_name(usename)}"
 
   $log.debug( "in make_muc_user: from: #{from}" )
 
   send_presence( from, room['user_jid'], nil, true, 'member', 'participant' )
 end
 
-def make_muc_user( room, user, uname )
-  $log.debug( "in make_muc_user: orig name: #{uname}\n" )
+# make_muc_user figures out out what sorts of name layouts the user
+# prefers, and makes a jabber user based on a campfire user with that
+# sort of name.
+def make_muc_user( room, realuser, uname )
+  $log.info( "Adding campfire user #{uname} to jabber room #{room['jabber_room_name']}\n" )
 
-  print "User dn: #{user['default_names']}"
-  print "User dn: #{user['similar_names:']}"
-  print "User : #{user}"
   # Figure out what the final name actually looks like.
   usename = nil
-  wantname = preferred_name( user['default_names'], uname )
+  wantname = preferred_name( realuser['default_names'], uname )
   if check_name_conflict( wantname, room )
-    secondwantname = preferred_name( user['similar_names'], uname )
+    secondwantname = preferred_name( realuser['similar_names'], uname )
     if check_name_conflict( secondwantname, room )
       # Default to "All"; since we already tested based on uname,
       # which is what we store in the hash, there should be no
@@ -228,7 +230,7 @@ def make_muc_user( room, user, uname )
       # The first version wasn't OK; so change whoever the
       # collission was with
       conflictfullname = check_name_conflict( wantname, room )
-      conflictnewname = preferred_name( user['similar_names'], conflictfullname )
+      conflictnewname = preferred_name( realuser['similar_names'], conflictfullname )
       drop_muc_user( room, conflictfullname )
 
       room['jabber_users'][conflictfullname] = conflictnewname
@@ -248,44 +250,69 @@ def make_muc_user( room, user, uname )
   make_muc_user_final( room, usename )
 end
 
+# Takes a user out of the virtual jabber room
 def drop_muc_user( room, uname )
-  $log.debug( "in drop_muc_user: orig name: #{uname}\n" )
-  from = "#{room['campfire_room_name']}@#{ArsonConfig::JabberComponentName}/#{name_to_jabber_nick(uname, room)}"
+  $log.info( "Removing campfire user #{uname} from jabber room #{room['jabber_room_name']}\n" )
+
+  from = "#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}/#{name_to_jabber_nick(uname, room)}"
 
   send_presence( from, room['user_jid'], :unavailable, true, 'none', 'none' )
 
   room['jabber_users'].delete(uname)
 end
 
-def send_to_jabber( room, uname, msg )
-  $log.debug("sending #{msg} to jabber room #{room['room_jid']}")
+# Sends an actual message, rather than a presence stanza, to jabber
+def send_to_jabber( room, from_campfire_user_name, our_campfire_user_name, msg )
+  $log.debug("In send_to_jabber, message #{msg} from name #{from_campfire_user_name} to jabber room #{room['room_jid']}; our name is #{our_campfire_user_name}")
 
-  from = "#{room['campfire_room_name']}@#{ArsonConfig::JabberComponentName}/#{name_to_jabber_nick(uname, room)}"
-  jmess = Jabber::Message.new( room['user_jid'], msg ).set_from( from ).set_type(:groupchat)
-  $jabber_component.send(jmess)
+  if from_campfire_user_name == our_campfire_user_name
+    $log.debug("In send_to_jabber, not sending." )
+  else
+    $log.debug("In send_to_jabber, sending." )
+    name_to_jabber_nick(from_campfire_user_name, room)
+    from = "#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}/#{name_to_jabber_nick(from_campfire_user_name, room)}"
+    jmess = Jabber::Message.new( room['user_jid'], msg ).set_from( from ).set_type(:groupchat)
+    $jabber_component.send(jmess)
+  end
 end
 
+# Sends a message to campfire
 def send_to_campfire( room, msg )
-  $log.debug("sending #{msg} to campfire room #{room[:campfire][:room_name]}")
-  Broach.speak( room[:campfire][:room_name], msg )
+  $log.debug("sending #{msg} to campfire room #{room['campfire_room_name']}")
+  if msg =~ /^\/me /
+    msg.gsub!(/^\/me (.*)/, '*\1*')
+    $log.debug("rewritten; sending #{msg} to campfire room #{room['campfire_room_name']}")
+  end
+
+  room['campfire_room'].speak( msg )
 end
 
 #*************************
-# This is the "make sure camfire knows we're here" section.
+# This is the "make sure camfire knows we're here" section; we just
+# loop forever, regularily re-joining the campfire room and checking
+# the nick list, because otherwise Campfire seems to get confused.
+#
+# This is probably way overzealous, but it seems to work.
 #*************************
 def stay_in_campfire_room( room, user )
   th = Thread.new do
-    begin
-      while true
+    attached = false
+    while true
+      begin
         $log.debug("checking room")
-#        $log.debug("check 1: #{room['broach_session'].get("presence.json")['rooms'].inspect} should include id #{room['campfire_room_id']}");
-#        $log.debug("check 2: #{room['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users']} should include id #{user['campfire_id']}");
+        #        $log.debug("check 1: #{room['broach_session'].get("presence.json")['rooms'].inspect} should include id #{room['campfire_room_id']}");
+        #        $log.debug("check 2: #{room['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users']} should include id #{user['campfire_id']}");
 
         # if ! room['broach_session'].get("presence.json")['rooms'].detect{ |x| x['id'] == room['campfire_room_id']} or
         #   ! room['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users'].
         #   detect{ |x| x['id'] == user['campfire_id']} then
 
-        $log.info( "attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}" )
+        if attached
+          $log.debug( "attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}" )
+        else
+          $log.info( "attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}" )
+          attached = true
+        end
 
         # This logs us in to the room.  We re-run it
         # periodically because we seem to fall out otherwise.
@@ -297,7 +324,7 @@ def stay_in_campfire_room( room, user )
         # fixed
 
         # REST here is from the nap egg, which is what broach uses
-#        $log.debug( "post: #{room['broach_session'].url_for("room/#{room['campfire_room_id']}/join")}, '', #{YAML::dump(room['broach_session'].headers_for(:post))}, #{YAML::dump(room['broach_session'].credentials)})" )
+        #        $log.debug( "post: #{room['broach_session'].url_for("room/#{room['campfire_room_id']}/join")}, '', #{YAML::dump(room['broach_session'].headers_for(:post))}, #{YAML::dump(room['broach_session'].credentials)})" )
         REST.post(room['broach_session'].url_for("room/#{room['campfire_room_id']}/join"), '', room['broach_session'].headers_for(:post), room['broach_session'].credentials)
         # end
 
@@ -306,17 +333,23 @@ def stay_in_campfire_room( room, user )
         fix_nicks( room, user )
 
         sleep 60
+      rescue SystemExit
+        exit
+      rescue Exception => e
+        attached = false
+        $log.info( "error in stay-attached thread: " )
+        $log.info( e )
       end
-    rescue SystemExit
-      exit
-    rescue Exception => e
-      $log.info( "error in stay-attached thread: #{e.inspect}" )
     end
   end
 end
 
 #************************************************
 # Campfire => Jabber Section
+#
+# Watches the campfire stream, and sends the resulting messages to
+# Jabber.  Kicks off a fix_nicks run if it sees something related to
+# user joins and leaves.
 #************************************************
 def campfire_to_jabber( room, user )
   th = Thread.new do
@@ -347,50 +380,67 @@ def campfire_to_jabber( room, user )
           when "TextMessage", "SoundMessage", "AdvertisementMessage",
             "AllowGuestsMessage", "DisallowGuestsMessage", "IdleMessage", "SystemMessage", 
             "TimestampMessage", "TopicChangeMessage", "UnidleMessage", "UnlockMessage"
-            if message['body'] != nil
+            if message['body'] != nil and message['user_id'] != nil
               $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending message: #{message['body']}" )
-              user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
-              send_to_jabber( room, user_name, message['body'] )
+              campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
+              send_to_jabber( room, campfire_user_name, user['campfire_name'], message['body'] )
             end
           when "PasteMessage"
-            user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
-            paste=message['body']
-            if user.has_key?('paste_length') and user['paste_length'] != 'all'
-              paste = paste.split("\n")[0,user['paste_length']].join("\n")
-            end
-            case user['paste_style']
-            when "plain"
-              $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending plain paste" )
-              send_to_jabber( room, user_name, paste )
-            when "border"
-              $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending border paste" )
-              send_to_jabber( room, user_name, 
-                             "-- START PASTE -------------------------------\n" +
-                             paste +
-                             "\n--  END PASTE  -------------------------------"
-                            )
-            when "border_url"
-              $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending border_url paste" )
-              send_to_jabber( room, user_name, 
-                             "-- START PASTE: #{room['broach_session'].url_for("room/#{room['campfire_room_id']}/paste/#{message['id']}")} -------------------------------\n" +
-              paste +
-                "\n--  END PASTE  -------------------------------"
-                            )
-            else
-              $log.fatal( "Invalid name paste_style #{user['paste_style']}; check the user config files." )
-              exit 1
+            if message['body'] != nil and message['user_id'] != nil
+              campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
+              paste=message['body']
+              trimmed=false
+              if user.has_key?('paste_length') and user['paste_length'] != 'all'
+                origlength = paste.split("\n").length
+                if origlength > user['paste_length']
+                  paste = paste.split("\n")[0,user['paste_length']].join("\n")
+                  trimmed = origlength - user['paste_length']
+                end
+              end
+              case user['paste_style']
+              when "plain"
+                $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending plain paste" )
+                if trimmed
+                  paste += "\n... #{trimmed} more lines ..."
+                end
+              when "border"
+                $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending border paste" )
+                paste = "-- START PASTE -------------------------------\n" + paste
+                if trimmed
+                  paste += "\n-- END PASTE #{trimmed} more lines -------------------------------"
+                else
+                  paste += "\n--  END PASTE  -------------------------------"
+                end
+              when "border_url"
+                paste_url = room['broach_session'].url_for("room/#{room['campfire_room_id']}/paste/#{message['id']}")
+                paste = "-- START PASTE: #{paste_url} -------------------------------\n" + paste
+                if trimmed
+                  paste += "\n-- END PASTE #{trimmed} more lines -------------------------------"
+                else
+                  paste += "\n--  END PASTE  -------------------------------"
+                end
+              else
+                $log.fatal( "Invalid name paste_style #{user['paste_style']}; check the user config files." )
+                exit 1
+              end
+              send_to_jabber( room, campfire_user_name, user['campfire_name'], paste )
             end
           when "UploadMessage"
-            user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
-            $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending upload" )
-            url ="room/#{room['campfire_room_id']}/messages/#{message['id']}/upload.json"
-            upload_info = room['broach_session'].get(url)
-            $log.debug( "upload info from #{url}: #{upload_info.inspect}" )
+            if message['body'] != nil and message['user_id'] != nil
+              campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
+              $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending upload" )
+              url ="room/#{room['campfire_room_id']}/messages/#{message['id']}/upload.json"
+              upload_info = room['broach_session'].get(url)
+              $log.debug( "upload info from #{url}: #{upload_info.inspect}" )
 
-            send_to_jabber( room, user_name, "-- UPLOAD: #{upload_info['upload']['full_url']} -------------------------------" )
+              send_to_jabber( room, campfire_user_name, user['campfire_name'], 
+                             "-- UPLOAD: #{upload_info['upload']['full_url']} -------------------------------" )
+            end
           when "KickMessage", "LeaveMessage", "JoinMessage", "EnterMessage"
-            uname = room['broach_session'].get("users/#{message['user_id']}.json")['user']['id']
-            fix_nicks( room, user )
+            if message['user_id'] != nil
+              uname = room['broach_session'].get("users/#{message['user_id']}.json")['user']['id']
+              fix_nicks( room, user )
+            end
           else
             $log.info( "In while in room thread for #{room['campfire_room_name']}, unknown message type; message: #{message.inspect}" )
           end
@@ -400,73 +450,23 @@ def campfire_to_jabber( room, user )
         exit
       rescue Exception => e
         $log.info( "detached from room #{room['campfire_room_name']} via error: " )
-        $log.info $!, $!.backtrace
+        $log.info( e )
       end
     end
   end
 end
 
-Daemons.run_proc('arson',
-                :dir_mode => :script,
-                :monitor => true,
-                :log_output => true ) do
+# tell jabber that we haven't heard of this user
+def bad_user( from, to )
+  $log.debug( "Sending bad user alert from #{from} to #{to}" )
+  presence = Jabber::Presence.new.set_from(from).set_to(to).set_type(:error)
+  presence.add_element( Jabber::MUC::XMUC.new() )
+  presence.add_element(
+    Jabber::ErrorResponse.new( "not-authorized", "The campfire server has never heard of you." ).set_type(:auth))
+  $jabber_component.send(presence)
+end
 
-  $log.level = ArsonConfig::LogLevel
-
-  Jabber::debug = ArsonConfig::JabberDebug
-
-  $jabber_component = Jabber::Component::new(ArsonConfig::JabberComponentName, ArsonConfig::JabberComponentHost)
-  $jabber_component.connect
-  $jabber_component.auth(ArsonConfig::JabberComponentSecret)
-
-  $jabber_component.add_message_callback do |message|
-    $log.debug( "In add_message_callback: #{YAML::dump(message)}" )
-    to = message.to.to_s
-    from = message.from.to_s
-    body = message.body.to_s
-    $log.debug( "In add_message_callback: to: #{to}, from: #{from}, body: #{body}" )
-#    #************************************************
-#    # Jabber => Campfire Section
-#    #************************************************
-#    def muc_room_callback( room ) 
-#      room[:jabber][:users]['virt_campfire'].add_message_callback do |message|
-#        # Make sure it's directed to the master user
-#        if to =~ Regexp.new("virt_campfire@campfire.localhost")
-#          $log.debug( "muc full message: #{YAML::dump(message)}")
-#
-#          virtual_user = false
-#
-#          # make sure it didn't come from any of our virtual users
-#          room[:jabber][:users].keys.each do |uname|
-#            $log.debug( "uname check: #{name_to_jabber_nick(uname, room)} vs --#{message.from.to_s.inspect}--" )
-#
-#            if Regexp.new("@conference.localhost/#{name_to_jabber_nick(uname, room)}$").match( message.from.to_s )
-#              $log.debug( "uname check failed" )
-#              # It's from one of our virtual users; no thank you.
-#              virtual_user = true
-#            end
-#          end
-#
-#          # Basic OK checks on the message
-#          if message.from != '' and message.body != '' and not virtual_user and not
-#            # make sure it isn't a delayed/history message
-#            message.elements.find { |elem| elem.class.to_s == 'Jabber::Delay::XDelay' } and
-#            send_to_campfire( room, message.body )
-#          end
-#        end
-#      end
-#
-#      #   room[:jabber][:users]['virt_campfire'].on_message do |time, from, body| 
-#      #     $log.debug( "muc message: #{time.inspect}, #{from.inspect}, #{body.inspect}" )
-#      #     if from != '' and body != '' and not
-#      #         room[:jabber][:users].keys.find { |uname| uname =~ Regexp.new("@campfire.localhost/#{uname}$") }
-#      #         print "FIXME\n"
-#      #       #send_to_campfire( room, body )
-#      #     end
-#      #   end
-#    end
-  end
-
+def setup_jabber_presence_callback
   # Jabber Presence Handling
   $jabber_component.add_presence_callback do |pres|
     user_found=false
@@ -484,7 +484,7 @@ Daemons.run_proc('arson',
 
         # We've found the user; now find the room
         user['rooms'].each do |room|
-          if room['campfire_room_name'].casecmp( to.gsub(/\@.*/, '') ) == 0
+          if room['jabber_room_name'].casecmp( to.gsub(/\@.*/, '') ) == 0
             # We've matched the room; do we already have it?
             if ! room.has_key?('campfire_room')
               $log.debug( "Presence received for room #{to}, setting it up now." )
@@ -499,6 +499,8 @@ Daemons.run_proc('arson',
               # if we don't already have it.
               if ! user.has_key?('campfire_id')
                 user['campfire_id'] = Broach.session.get("users/me.json")['user']['id']
+
+                user['campfire_name'] = Broach.session.get("users/me.json")['user']['name']
               end
 
               room['jabber_users'] = Hash.new
@@ -509,9 +511,13 @@ Daemons.run_proc('arson',
 
               room['broach_session'] = Broach.session
 
+              room['campfire_user_name'] = room['broach_session'].get("users/#{user['campfire_id']}")['user']['name']
+
               room['user_jid'] = from
 
               room['room_jid'] = to
+
+              $log.debug( "Final room setup results: #{YAML::dump(room)}" )
 
               fix_nicks( room, user )
 
@@ -526,162 +532,154 @@ Daemons.run_proc('arson',
             else
               $log.debug( "Presence received for room #{to}, but it needs no setup." )
             end
-          else
-            print "No room match\n"
           end
         end
       end
     end
 
     if ! user_found
-        presence = Jabber::Presence.new.set_from(to.gsub(/\/[^\/]*$/, '')).set_to(from).set_type(:error)
-        print "presence: #{YAML::dump(presence)}\n"
-        presence.add_element( Jabber::MUC::XMUC.new() )
-        print "presence: #{YAML::dump(presence)}\n"
-        presence.add_element( Jabber::ErrorResponse.new( "not-authorized", "The campfire server has never heard of you." ).set_type(:auth))
-        print "presence: #{YAML::dump(presence)}\n"
-        $jabber_component.send(presence)
+      bad_user( to.gsub(/\/[^\/]*$/, ''), from )
+    end
+  end
+end
+
+#************************************************
+# Jabber => Campfire Section
+#
+# Just listens for jabber messages and dispatches them to campfire
+# if they seem relevant.
+#************************************************
+def setup_jabber_message_callback
+  $jabber_component.add_message_callback do |message|
+    begin
+      # $log.debug( "In add_message_callback: #{YAML::dump(message)}" )
+
+      to = message.to.to_s
+      from = message.from.to_s
+      body = message.body.to_s
+      $log.debug( "In add_message_callback: to: #{to}, from: #{from}, body: #{body}" )
+
+      user_found=false
+      room_found=false
+
+      $users.each do |user|
+        if Regexp.new("^#{user['jabber_id']}/").match( from )
+          user_found = true
+
+          # We've found the user; now find the room
+          user['rooms'].each do |room|
+            if room['jabber_room_name'].casecmp( to.gsub(/\@.*/, '') ) == 0
+              room_found=true
+              send_to_campfire( room, message.body )
+            end
+          end
+        end
+      end
+
+      if ! user_found
+        bad_user( to.gsub(/\/[^\/]*$/, ''), from )
+      end
+
+      if ! room_found
+        $log.error( "Message sent to unknown jabber room #{to}" )
+      end
+    rescue SystemExit
+      $log.info( "Exit received in jabber message callback" )
+      exit
+    rescue Exception => e
+      $log.info( "Error received in jabber message callback: " )
+      $log.info( e )
+    end
+  end
+end
+
+#************************************************
+# Server setup/running
+#************************************************
+Daemons.run_proc('arson',
+                :dir_mode => :normal,
+                :dir => ArsonConfig::LogDir,
+                :monitor => true,
+                :log_output => true ) do
+
+  #************************************************
+  # Configuration Loading
+  #************************************************
+  $log = Logger.new(STDERR)
+
+  $log.level = ArsonConfig::LogLevel
+
+  Jabber::debug = ArsonConfig::JabberDebug
+
+  $users = Array.new
+
+  ArsonConfig::Configs.each do |configfile|
+    $users.push( YAML.load_file(configfile) )
+  end
+
+  $users.each do |user|
+    user['rooms'].map! do |roomname|
+      # Turn the room from a simple string into a hash
+      room = Hash.new
+      room['campfire_room_name'] = roomname
+
+      # Fix bad jabber characters
+      room['jabber_room_name'] = roomname.gsub(/\W+/,'-').gsub(/"\&'\/:<>@/,'')
+
+      if room['campfire_room_name'] != room['jabber_room_name']
+        $log.info( "Room name #{room['campfire_room_name']} not acceptable for Jabber, so the room name there is #{room['jabber_room_name']}" )
+      end
+
+      room
     end
   end
 
-  print "stopping\n"
+  $log.debug( "Config loaded: Users: #{YAML::dump($users)}" )
 
-  sleep 10000000
+  #************************************************
+  # Drop all the virtual users when we exit
+  #************************************************
+  at_exit do
+    $users.each do |user|
+      user['rooms'].each do |room|
 
+        $log.info( "Shutting down for room #{room['campfire_room_name']} for user #{user['jabber_id']}" )
+
+        room_jid=nil
+        if room.has_key?('room_jid')
+          room_jid=room['room_jid']
+        else
+          room_jid="#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}"
+        end
+
+        user_jid=nil
+        if room.has_key?('user_jid')
+          user_jid=room['user_jid']
+        else
+          user_jid=user['jabber_id']
+        end
+
+        send_presence( room_jid, user_jid, :unavailable, true, 'none', 'none', 'Campfire server shutting down.', [ '307' ] )
+      end
+    end
+  end
+
+  #************************************************
+  # Server Setup
+  #************************************************
+  $jabber_component = Jabber::Component::new(ArsonConfig::JabberComponentName)
+  $jabber_component.connect(ArsonConfig::JabberComponentHost)
+  $jabber_component.auth(ArsonConfig::JabberComponentSecret)
+
+  #************************************************
+  # Actual server code
+  #************************************************
+  setup_jabber_message_callback
+
+  setup_jabber_presence_callback
+
+  #************************************************
+  # Hang until signal
+  #************************************************
   Thread.stop
-
-##   Broach.settings = {
-##     'account' => 'engineyard',
-##     'token'   => campfire_token,
-##     'use_ssl' => true
-##   }
-## 
-##   my_campfire_id = Broach.session.get("users/me.json")['user']['id']
-## 
-##   # setup
-##   $rooms.each do |room|
-##     print "\n\n***************ROOOOM\n\n"
-##     room[:jabber][:users] = Hash.new
-## 
-##     room[:campfire_room] = Broach::Room.find_by_name( room[:campfire][:room_name] )
-## 
-##     fix_nicks( room )
-## 
-##     muc_room_callback( room )
-## 
-##     ##       jabber_muc = Jabber::Simple.new(room[:jabber][:user], room[:jabber][:pass])
-##     ##       # If you don't wait, jabber might not notice you
-##     ##       sleep 5;
-##     ##       im.add(room[:jabber][:deliver_to]);
-##     ## 
-##     ##       room[:im] = im
-##     ## 
-##     ##       room[:last_message] = 0
-##     ## 
-##     ##       room[:check_counter] = 999999
-##   end
-## 
-##   #*************************
-##   # This is the "make sure camfire knows we're here" section.
-##   #*************************
-##   th = Thread.new do
-##     begin
-##       $rooms.each do |room|
-##         campfire_room = room[:campfire_room]
-##         campfire_room_id = room[:campfire_room].id
-## 
-##         $log.debug("checking room")
-##         $log.debug("check 1: #{Broach.session.get("presence.json")['rooms'].inspect} should include id #{campfire_room_id}");
-##         $log.debug("check 2: #{Broach.session.get("room/#{campfire_room_id}.json")['room']['users']} should include id #{my_campfire_id}");
-##         #          if room[:check_counter] > 10 or
-##         #            ! Broach.session.get("presence.json")['rooms'].detect{ |x| x['id'] == campfire_room_id} or
-##         #            ! Broach.session.get("room/#{campfire_room_id}.json")['room']['users'].detect{ |x| x['id'] == my_campfire_id} then
-## 
-##         $log.info( "attaching to room #{room[:campfire][:room_name]}, id #{campfire_room_id}" )
-## 
-##         # This logs us in to the room.  We re-run it
-##         # periodically because we seem to fall out otherwise.
-##         #
-##         # Broach can't handle POST calls that return a flat 200,
-##         # which is a problem since the API does this repeatedly.
-##         #
-##         # FIXME:  Update the next line when that broach bug is
-##         # fixed
-##         REST.post(Broach.session.url_for("room/#{campfire_room_id}/join"), '', Broach.session.headers_for(:post), Broach.session.credentials)
-## 
-##         #            room[:check_counter] = 0
-##         #          end
-##       end
-##     rescue SystemExit
-##       exit
-##     rescue Exception => e
-##       $log.info( "error in stay-attached thread: #{e.inspect}" )
-##     end
-## 
-## 
-##     sleep 60
-##   end
-##   #*************************
-##   # END "make sure camfire knows we're here" section.
-##   #*************************
-## 
-##   #************************************************
-##   # Campfire => Jabber Section
-##   #************************************************
-##   $rooms.each do |room|
-##     th = Thread.new do
-##       if room[:campfire_room] == nil
-##         $log.error( "Room #{room[:campfire][:room_name]} doesn't seem to be working in Broach; perhaps the name is wrong?" )
-##         break
-##       end
-## 
-##       $log.debug( "In room thread for #{room[:campfire][:room_name]}" )
-## 
-##       campfire_room = room[:campfire_room]
-##       campfire_room_id = room[:campfire_room].id
-## 
-##       url = URI.parse("http://#{campfire_token}:x@streaming.campfirenow.com/room/#{campfire_room_id}/live.json")
-## 
-##       while true
-##         begin
-##           $log.debug( "In while in room thread for #{room[:campfire][:room_name]}" )
-## 
-##           # Stream messages from the campfire room
-##           Yajl::HttpStream.get(url) do |message|
-## ## {"room_id"=>343561, "created_at"=>"2011/02/12 04:30:00 +0000", "body"=>nil, "id"=>311411718, "type"=>"TimestampMessage", "user_id"=>nil}
-## ## {"room_id"=>343561, "created_at"=>"2011/02/12 04:34:02 +0000", "body"=>"cf test #3", "id"=>311411719, "type"=>"TextMessage", "user_id"=>733667}
-## ##   <type>#{TextMessage || PasteMessage || SoundMessage || AdvertisementMessage ||
-## ##             AllowGuestsMessage || DisallowGuestsMessage || IdleMessage || KickMessage ||
-## ##                         LeaveMessage || SystemMessage || TimestampMessage || TopicChangeMessage ||
-## ##                                   UnidleMessage || UnlockMessage || UploadMessage}</type>
-## ##             </message>
-##             $log.debug( "In while in room thread for #{room[:campfire][:room_name]}, message: #{message.inspect}" )
-##             case message['type']
-##             when "TextMessage", "PasteMessage", "SoundMessage", "AdvertisementMessage",
-##               "AllowGuestsMessage", "DisallowGuestsMessage", "IdleMessage", "SystemMessage", 
-##               "TimestampMessage", "TopicChangeMessage", "UnidleMessage", "UnlockMessage", "UploadMessage"
-##               if message['body'] != nil
-##                 $log.debug( "In while in room thread for #{room[:campfire][:room_name]}, sending message: #{message['body']}" )
-##                 user_name=Broach.session.get("users/"+message['user_id'].to_s)['user']['name']
-##                 send_to_jabber( room, user_name, message['body'] )
-##               end
-##             when "KickMessage", "LeaveMessage", "JoinMessage", "EnterMessage"
-##               fix_nicks( room )
-##             else
-##               $log.info( "In while in room thread for #{room[:campfire][:room_name]}, unknown message type; message: #{message.inspect}" )
-##             end
-##           end
-##         rescue SystemExit
-##           $log.info( "Exit received in room thread for #{room[:campfire][:room_name]}" )
-##           exit
-##         rescue Exception => e
-##           $log.info( "detached from room #{room[:campfire][:room_name]} via error: #{e.inspect}" )
-##         end
-##       end
-## 
-##     end
-##   end
 end
-
-
-Thread.stop

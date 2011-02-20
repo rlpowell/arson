@@ -35,16 +35,38 @@ component on your jabber server is up to you.
 Basic Setup
 -----------
 
-Stick arson.rb and ArsonConfig.rb in a directory somewhere.
+Get the code with:
 
-Modify ArsonConfig.rb to your liking; there are instructions in the
+  git clone git://github.com/rlpowell/arson.git
+
+Copy ExampleArsonConfig.rb to ArsonConfig.rb and modify
+ArsonConfig.rb to your liking; there are instructions in the
 comments there.  It's Ruby code, so be mindful of the syntax.
-FIXME: Config Instructions here?
+
+Normally, though, you should only have to change the
+JabberComponentSecret, the list of user config files, and the
+LogFile.
+
+Per-User Setup
+--------------
+
+In ArsonConfig.rb is the Configs array, which is a list of file
+names.  Each of those files is taken as the configuration file for an
+arson user.  The server needs to be run such that it can read those
+files.  Configuration is only loaded on startup.
+
+The files are YAML, and fairly straightforward; see example_arsonrc
+for details.  Copy it to ~/.arsonrc (or wherever) and change it as
+you like.
 
 ejabberd Setup
 --------------
 
 Install ejabberd on the host you'll be running arson on.
+
+Make an account for you on ejabberd like so:
+
+  sudo ejabberdctl register USERNAME localhost PASSWORD
 
 Add the following to your ejabberd.cfg, in the same place as the
 example ejabberd_service that should already be there (in the
@@ -55,7 +77,7 @@ example ejabberd_service that should already be there (in the
   {5347, ejabberd_service, [
                             {access, all},
                             {hosts, ["campfire.localhost"],
-                                    [{password, "campfirepass"}]
+                                    [{password, "[COMPONENT PASSWORD]"}]
                             }
                             ]},
 
@@ -80,10 +102,9 @@ Stop  with:     ruby arson.rb stop
           bitlbee/IRC Instructions
           ------------------------
 
-Get bitlbee installed and running.  Make an account for you on
-ejabberd like so:
-
-  sudo ejabberdctl register USERNAME localhost PASSWORD
+You can use arson to get access to campfire in your IRC client by
+using http://www.bitlbee.org/ , which is what I wrote it for in the
+first place.
 
 Old bitlbee (1.2.3 or so)
 -------------------------
@@ -108,7 +129,7 @@ bitlbee 3.0 is better because it doesn't screw up the capitalization.
 
 Create the account in bitlbee:
 
-  account add jabber rpowell2@localhost password
+  account add jabber USERNAME@localhost PASSWORD
 
 Start it up:
 
@@ -116,6 +137,26 @@ Start it up:
 
 Join each room; this uses the jabber room name from the config file:
 
-  chat add 0 cjh2_test_chat@conference.localhost
+  chat add 0 Testing@campfire.localhost
 
-FIXME: TODO: Option to drop last names and shit from CF.
+
+          Acknowledgements & Legal
+          ------------------------
+
+This project wouldn't exist without the help of my friend Stephen
+Weeks ( http://allalone.org/ ), who suggested the component solution
+and explain how XMPP (aka Jabber) works to me.
+
+I've used examples and code snippets from various places around the
+web in making arson; not counting the various XEPs and RFCs, here's
+an incomplete list:
+
+  http://superjared.com/entry/new-projects/
+
+  http://www.rubyfleebie.com/xmpp4r-a-real-world-example/
+
+  http://www.mail-archive.com/xmpp4r-devel@gna.org/msg01021.html
+
+Having said that, none of the code I copied survives, and all the
+arson code is hereby placed irrevocably in the public domain by me,
+Robin Lee Powell.

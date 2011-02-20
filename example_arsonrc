@@ -1,0 +1,40 @@
+# The campfire token; instructions are at
+# http://developer.37signals.com/campfire/ and also repeated here:
+#
+#   Authenticating is done with an authentication token, which you'll
+#   find on the "Edit my Campfire account" screen in Campfire (click
+#   the "Reveal authentication token for API" link).
+# 
+campfire_token: [token]
+
+# Your jabber user id
+jabber_id: [user]@localhost
+
+# Name options are: first (only first word of the name), firstni
+# (first word and first letter of the next word), and all.
+# 
+# default_names is what it does by default, that is, if there's no
+# collission at that level.
+#
+# similar_names is what it tries if there's a collision.  If there's
+# still a collision, it falls back to all.
+default_names: first
+similar_names: firstni
+
+# Paste style is one of plain, border (special lines above and below
+# each paste) or border_url (same, but a URL to the paste by itself
+# is given).
+#
+# Paste length is a number or "all"
+paste_style: border_url
+paste_length: 10
+
+# Just a list of Camfire room names.
+#
+# The Jabber room names are based on the Campfire room names, except
+# that special characters ("&'<>, etc) are removed, and space is
+# replaced with -
+rooms:
+  - Support
+  - Testing
+  - Zendesk Updates
