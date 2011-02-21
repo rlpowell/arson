@@ -397,27 +397,41 @@ def campfire_to_jabber( room, user )
                   trimmed = origlength - user['paste_length']
                 end
               end
+
+              paste_url = room['broach_session'].url_for("room/#{room['campfire_room_id']}/paste/#{message['id']}")
+
+              # There are various interactions between the user
+              # configs paste_url, paste_style, and paste_length, so
+              # this gets a bit complicated.
               case user['paste_style']
               when "plain"
                 $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending plain paste" )
-                if trimmed
-                  paste += "\n... #{trimmed} more lines ..."
+                if user['paste_url'] == "only"
+                  paste = "PASTE: " + paste_url
+                else
+                  if user['paste_url'] == true
+                    paste = paste_url + ": " + paste
+                  end
+                  if trimmed
+                    paste += "\n... #{trimmed} more lines ..."
+                  end
                 end
               when "border"
                 $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending border paste" )
-                paste = "-- START PASTE -------------------------------\n" + paste
-                if trimmed
-                  paste += "\n-- END PASTE #{trimmed} more lines -------------------------------"
+                if user['paste_url'] == "only"
+                  paste = "-- PASTE: #{paste_url} -------------------------------\n"
                 else
-                  paste += "\n--  END PASTE  -------------------------------"
-                end
-              when "border_url"
-                paste_url = room['broach_session'].url_for("room/#{room['campfire_room_id']}/paste/#{message['id']}")
-                paste = "-- START PASTE: #{paste_url} -------------------------------\n" + paste
-                if trimmed
-                  paste += "\n-- END PASTE #{trimmed} more lines -------------------------------"
-                else
-                  paste += "\n--  END PASTE  -------------------------------"
+                  if user['paste_url'] == true
+                    paste = "-- START PASTE #{paste_url} -------------------------------\n" + paste
+                  else
+                    paste = "-- START PASTE -------------------------------\n" + paste
+                  end
+
+                  if trimmed
+                    paste += "\n-- END PASTE #{trimmed} more lines -------------------------------"
+                  else
+                    paste += "\n--  END PASTE  -------------------------------"
+                  end
                 end
               else
                 $log.fatal( "Invalid name paste_style #{user['paste_style']}; check the user config files." )

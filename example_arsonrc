@@ -22,11 +22,14 @@ default_names: first
 similar_names: firstni
 
 # Paste style is one of plain, border (special lines above and below
-# each paste) or border_url (same, but a URL to the paste by itself
-# is given).
+# each paste).
+#
+# Paste URL is one of: true to show a link to the URL to the paste
+# by itself, false to not, only to show the URL but no paste body.
 #
 # Paste length is a number or "all"
-paste_style: border_url
+paste_style: border
+paste_url: true
 paste_length: 10
 
 # Just a list of Camfire room names.
