@@ -70,7 +70,7 @@ $users = nil
 
 # This code is making up for the fact that xmpp4r doesn't know how
 # to generate the presence stanzas we need in any clean fashion.
-def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason=nil, status_codes=nil )
+def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason=nil, status_codes=nil, item_jid=nil )
   $log.debug( "In send_presence: #{from}, #{to}, #{type}, #{xmuc}, #{affiliation}, #{role}, #{reason}, #{status_codes}" )
   presence = Jabber::Presence.new.set_from( from )
   presence.set_to( to ).set_type( type )
@@ -80,7 +80,11 @@ def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason
     #print "presence: #{YAML::dump(presence)}\n"
 
     if affiliation and role
-      itemelem = xelem.add_element( 'item', { 'affiliation' => affiliation, 'role' => role } )
+      if item_jid
+        itemelem = xelem.add_element( 'item', { 'affiliation' => affiliation, 'role' => role, 'jid' => item_jid } )
+      else
+        itemelem = xelem.add_element( 'item', { 'affiliation' => affiliation, 'role' => role } )
+      end
       if reason
         itemelem.add_element( 'reason' ).add_text( reason )
       end
@@ -196,7 +200,7 @@ def make_muc_user_final( room, usename )
 
   $log.debug( "in make_muc_user: from: #{from}" )
 
-  send_presence( from, room['user_jid'], nil, true, 'member', 'participant' )
+  send_presence( from, room['user_jid'], nil, true, 'member', 'participant', nil, nil, "#{slugify_name(usename)}@#{ArsonConfig::JabberComponentName}/#{slugify_name(usename)}" )
 end
 
 # make_muc_user figures out out what sorts of name layouts the user

@@ -120,7 +120,7 @@ Start it up:
 
 Join each room; this uses the jabber room name from the config file:
 
-  join_chat [account number] [jabber room name]@conference.localhost
+  join_chat [account number] [jabber room name]@campfire.localhost
 
 New bitlbee (3.0 or so)
 -----------------------
@@ -139,6 +139,21 @@ Join each room; this uses the jabber room name from the config file:
 
   chat add 0 Testing@campfire.localhost
 
+  /join #testing
+
+Nick Issues
+-----------
+
+As of this writing (22 Feb 2011) there are issues with bitlbee 3.0.1
+such that all the nicks in a Jabber MUC get lowercased.  In fact,
+Jabber MUCs of the style that arson creates (non-anonymous) may not
+work at all.  There's a bitlbee variable called "lcnicks" (use "help
+set" to see how to set it) that should change this, but it's
+ignored.
+
+To make everything work OK, you should apply the patches at
+http://bugs.bitlbee.org/bitlbee/ticket/757 and
+http://bugs.bitlbee.org/bitlbee/ticket/415
 
           Acknowledgements & Legal
           ------------------------
