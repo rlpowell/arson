@@ -20,7 +20,11 @@ Arson is written in Ruby.
 
 Gems
 ----
-
+  
+  sudo gem install broach
+  sudo gem install daemons
+  sudo gem install yajl-ruby
+  sudo gem install xmpp4r
 
 Other
 -----

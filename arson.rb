@@ -729,5 +729,3 @@ Daemons.run_proc('arson',
   #************************************************
   Thread.stop
 end
-
-Thread.stop
