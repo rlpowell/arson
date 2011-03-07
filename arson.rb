@@ -124,14 +124,22 @@ def fix_nicks( room, realuser )
   campfire_room_id = room['campfire_room'].id
 
   room_info = room['broach_session'].get("room/#{campfire_room_id}.json")
-#  $log.debug("users in room: #{room_info['room']['users'].inspect}")
+  $log.debug("fix_nicks: users according to campfire for room #{room['jabber_room_name']} : #{YAML::dump(room_info['room']['users'].map { |u| u['name'] })}")
+  $log.debug("fix_nicks: users according to us for room #{room['jabber_room_name']} : #{YAML::dump(room['jabber_users'])}")
 
   # Check that every room user has a MUC equivalent
   room_info['room']['users'].each do |user|
     uname = user['name']
-    # The second part here is to ignore the real user's campfire name
-    if ! room['jabber_users'][uname] and room['campfire_user_name'] != uname then
-      make_muc_user( room, realuser, uname )
+    # Check if the user is in jabber
+    if ! room['jabber_users'][uname]
+      # Ignore the real user's campfire name
+      if room['campfire_user_name'] != uname then
+        make_muc_user( room, realuser, uname )
+      end
+    else
+      # The user is already in jabber, but send the presence anyways
+      $log.debug( "fix_nicks: Send presence for #{uname} with name #{room['jabber_users'][uname]}" )
+      make_muc_user_final( room, room['jabber_users'][uname] )
     end
   end
 
@@ -164,7 +172,12 @@ end
 
 # Just the first word and the first letter of the next word
 def name_firstni( name )
-  return name.split[0]+" "+name.split[1][0,1]
+  splitted=name.split
+  if splitted.length < 2
+    return splitted[0]
+  else
+    return splitted[0]+" "+splitted[1][0,1]
+  end
 end
 
 # Returns the name format of the user preference type given.
@@ -337,7 +350,12 @@ def stay_in_campfire_room( room, user )
         fix_nicks( room, user )
 
         sleep 60
+      rescue SocketError
+        $log.info( "Networking problems in stay attached thread with error: " )
+        $log.info( e )
+        exit
       rescue SystemExit
+        $log.info( "Exit requetsed in stay attached thread" )
         exit
       rescue Exception => e
         attached = false
@@ -383,7 +401,7 @@ def campfire_to_jabber( room, user )
           case message['type']
           when "TextMessage", "SoundMessage", "AdvertisementMessage",
             "AllowGuestsMessage", "DisallowGuestsMessage", "IdleMessage", "SystemMessage", 
-            "TimestampMessage", "TopicChangeMessage", "UnidleMessage", "UnlockMessage"
+            "TimestampMessage", "TopicChangeMessage", "UnidleMessage", "UnlockMessage", "TweetMessage"
             if message['body'] != nil and message['user_id'] != nil
               $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending message: #{message['body']}" )
               campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
@@ -463,6 +481,10 @@ def campfire_to_jabber( room, user )
             $log.info( "In while in room thread for #{room['campfire_room_name']}, unknown message type; message: #{message.inspect}" )
           end
         end
+      rescue SocketError
+        $log.info( "Networking problems in room thread for #{room['campfire_room_name']} with error: " )
+        $log.info( e )
+        exit
       rescue SystemExit
         $log.info( "Exit received in room thread for #{room['campfire_room_name']}" )
         exit
@@ -601,6 +623,10 @@ def setup_jabber_message_callback
       if ! room_found
         $log.error( "Message sent to unknown jabber room #{to}" )
       end
+    rescue SocketError
+      $log.info( "Networking problems in jabber message callback with error: " )
+      $log.info( e )
+      exit
     rescue SystemExit
       $log.info( "Exit received in jabber message callback" )
       exit
@@ -658,26 +684,28 @@ Daemons.run_proc('arson',
   # Drop all the virtual users when we exit
   #************************************************
   at_exit do
-    $users.each do |user|
-      user['rooms'].each do |room|
+    if $jabber_component.is_connected?
+      $users.each do |user|
+        user['rooms'].each do |room|
 
-        $log.info( "Shutting down for room #{room['campfire_room_name']} for user #{user['jabber_id']}" )
+          $log.info( "Shutting down room #{room['campfire_room_name']} for user #{user['jabber_id']}" )
 
-        room_jid=nil
-        if room.has_key?('room_jid')
-          room_jid=room['room_jid']
-        else
-          room_jid="#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}"
+          room_jid=nil
+          if room.has_key?('room_jid')
+            room_jid=room['room_jid']
+          else
+            room_jid="#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}"
+          end
+
+          user_jid=nil
+          if room.has_key?('user_jid')
+            user_jid=room['user_jid']
+          else
+            user_jid=user['jabber_id']
+          end
+
+          send_presence( room_jid, user_jid, :unavailable, true, 'none', 'none', 'Campfire server shutting down.', [ '307' ] )
         end
-
-        user_jid=nil
-        if room.has_key?('user_jid')
-          user_jid=room['user_jid']
-        else
-          user_jid=user['jabber_id']
-        end
-
-        send_presence( room_jid, user_jid, :unavailable, true, 'none', 'none', 'Campfire server shutting down.', [ '307' ] )
       end
     end
   end
@@ -701,3 +729,5 @@ Daemons.run_proc('arson',
   #************************************************
   Thread.stop
 end
+
+Thread.stop
