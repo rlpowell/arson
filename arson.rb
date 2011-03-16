@@ -581,7 +581,7 @@ def setup_jabber_presence_callback
                 $log.debug( "Presence received for room #{to}, setting it up now." )
                 # We don't; set it up
                 Broach.settings = {
-                  'account' => 'engineyard',
+                  'account' => ArsonConfig::CampfireDomain.gsub(/\..*/, ''),
                   'token'   => user['campfire_token'],
                   'use_ssl' => true
                 }
