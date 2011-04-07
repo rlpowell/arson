@@ -68,6 +68,17 @@ $users = nil
 # If you're looking for the main program flow, search for "Daemons"
 #**************************************************
 
+# Send stuff to jabber with retries
+def jabber_send( stuff )
+  begin
+    $jabber_component.send(stuff)
+  rescue Exception => e
+    $log.info( "Couldn't send to jabber due to error: " )
+    $log.info( e )
+    jabber_reset
+  end
+end
+
 # This code is making up for the fact that xmpp4r doesn't know how
 # to generate the presence stanzas we need in any clean fashion.
 def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason=nil, status_codes=nil, item_jid=nil )
@@ -98,7 +109,7 @@ def send_presence( from, to, type, xmuc=false, affiliation=nil, role=nil, reason
       #print "presence: #{YAML::dump(presence)}\n"
     end
 
-    $jabber_component.send(presence)
+    jabber_send(presence)
   end
 end
 
@@ -120,7 +131,6 @@ end
 # layouts the user prefers.
 #
 def fix_nicks( room, realuser )
-  campfire_room = room['campfire_room']
   campfire_room_id = room['campfire_room_id']
 
   room_info = room['broach_session'].get("room/#{campfire_room_id}.json")
@@ -178,7 +188,7 @@ def name_firstni( name )
   if splitted.length < 2
     return splitted[0]
   else
-    return splitted[0]+" "+splitted[1][0,1]
+    return splitted[0]+"_"+splitted[1][0,1]
   end
 end
 
@@ -191,7 +201,7 @@ def preferred_name( type, name )
   when "firstni"
     return name_firstni( name )
   when "all"
-    return name
+    return name.split.join('_')
   else
     $log.fatal( "Invalid name handling type #{type}; check the user config files." )
     exit 1
@@ -222,7 +232,7 @@ end
 # prefers, and makes a jabber user based on a campfire user with that
 # sort of name.
 def make_muc_user( room, realuser, uname )
-  $log.info( "Adding campfire user #{uname} to jabber room #{room['jabber_room_name']}\n" )
+  $log.info( "Adding campfire user #{uname} to jabber room #{room['jabber_room_name']} for #{room['user_jid']} \n" )
 
   # Figure out what the final name actually looks like.
   usename = nil
@@ -291,19 +301,22 @@ def send_to_jabber( room, from_campfire_user_name, our_campfire_user_name, msg )
     from = "#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}/#{name_to_jabber_nick(from_campfire_user_name, room)}"
     jmess = Jabber::Message.new( room['user_jid'], msg ).set_from( from ).set_type(:groupchat)
     $log.debug("In send_to_jabber, final version: #{YAML::dump(jmess)}")
-    $jabber_component.send(jmess)
+    jabber_send(jmess)
   end
 end
 
 # Sends a message to campfire
 def send_to_campfire( room, msg )
-  $log.debug("sending #{msg} to campfire room #{room['campfire_room_name']}")
+  $log.debug("sending #{msg} to campfire room #{room['campfire_room_name']} from user #{room['user_jid']}")
   if msg =~ /^\/me /
     msg.gsub!(/^\/me (.*)/, '*\1*')
     $log.debug("rewritten; sending #{msg} to campfire room #{room['campfire_room_name']}")
   end
 
-  room['campfire_room'].speak( msg )
+  room['broach_session'].post("room/#{room['campfire_room_id']}/speak", 'message' => {
+    'type' => 'TextMessage',
+    'body' => msg,
+  })
 end
 
 #*************************
@@ -327,9 +340,9 @@ def stay_in_campfire_room( room, user )
         #   detect{ |x| x['id'] == user['campfire_id']} then
 
         if attached
-          $log.debug( "attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}" )
+          $log.debug( "Already attachd; not attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
         else
-          $log.info( "attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}" )
+          $log.info( "Attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
           attached = true
         end
 
@@ -396,7 +409,7 @@ end
 #************************************************
 def campfire_to_jabber( room, user )
   th = Thread.new do
-    if room['campfire_room'] == nil
+    if room['broach_session'] == nil
       $log.error( "Room #{room['campfire_room_name']} doesn't seem to be working in Broach; perhaps the name is wrong?" )
       break
     end
@@ -527,7 +540,56 @@ def bad_user( from, to )
   presence.add_element( Jabber::MUC::XMUC.new() )
   presence.add_element(
     Jabber::ErrorResponse.new( "not-authorized", "The campfire server has never heard of you." ).set_type(:auth))
-  $jabber_component.send(presence)
+  jabber_send(presence)
+end
+
+def jabber_shutdown
+  if $jabber_component && $jabber_component.is_connected?
+    $users.each do |user|
+      user['rooms'].each do |room|
+
+        $log.info( "Shutting down room #{room['campfire_room_name']} for user #{user['jabber_id']}" )
+
+        room_jid=nil
+        if room.has_key?('room_jid')
+          room_jid=room['room_jid']
+        else
+          room_jid="#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}"
+        end
+
+        user_jid=nil
+        if room.has_key?('user_jid')
+          user_jid=room['user_jid']
+        else
+          user_jid=user['jabber_id']
+        end
+
+        send_presence( room_jid, user_jid, :unavailable, true, 'none', 'none', 'Campfire server shutting down.', [ '307' ] )
+      end
+    end
+  end
+end
+
+def jabber_reset
+  jabber_shutdown
+
+  if $jabber_component && $jabber_component.is_connected?
+    $jabber_component.close
+  end
+
+  #************************************************
+  # Server Setup
+  #************************************************
+  $jabber_component = Jabber::Component::new(ArsonConfig::JabberComponentName)
+  $jabber_component.connect(ArsonConfig::JabberComponentHost)
+  $jabber_component.auth(ArsonConfig::JabberComponentSecret)
+
+  #************************************************
+  # Actual server code
+  #************************************************
+  setup_jabber_message_callback
+
+  setup_jabber_presence_callback
 end
 
 def setup_jabber_presence_callback
@@ -556,8 +618,6 @@ def setup_jabber_presence_callback
 
             room['jabber_users'] = nil
 
-            room['campfire_room'] = nil
-
             room['broach_session'] = nil
 
             if room.has_key?('maint_thread') and room['maint_thread'] != nil
@@ -577,7 +637,7 @@ def setup_jabber_presence_callback
           user['rooms'].each do |room|
             if room['jabber_room_name'].casecmp( to.gsub(/\@.*/, '') ) == 0
               # We've matched the room; do we already have it?
-              if ! room.has_key?('campfire_room') or room['campfire_room'] == nil
+              if ! room.has_key?('broach_session') or room['broach_session'] == nil
                 $log.debug( "Presence received for room #{to}, setting it up now." )
                 # We don't; set it up
                 Broach.settings = {
@@ -596,9 +656,7 @@ def setup_jabber_presence_callback
 
                 room['jabber_users'] = Hash.new
 
-                room['campfire_room'] = Broach::Room.find_by_name( room['campfire_room_name'] )
-
-                room['campfire_room_id'] = room['campfire_room'].id
+                room['campfire_room_id'] = Broach::Room.find_by_name( room['campfire_room_name'] ).id
 
                 room['broach_session'] = Broach.session
 
@@ -608,7 +666,7 @@ def setup_jabber_presence_callback
 
                 room['room_jid'] = to
 
-                $log.debug( "Final room setup results: #{YAML::dump(room)}" )
+                $log.debug( "Final room setup for user #{from}: results: #{YAML::dump(room)}" )
 
                 fix_nicks( room, user )
 
@@ -667,6 +725,8 @@ def setup_jabber_message_callback
         $users.each do |user|
           if Regexp.new("^#{user['jabber_id']}/").match( from )
             user_found = true
+
+            $log.debug( "User jid #{user['jabber_id']} matches from #{from}" )
 
             # We've found the user; now find the room
             user['rooms'].each do |room|
@@ -749,45 +809,10 @@ Daemons.run_proc('arson',
   # Drop all the virtual users when we exit
   #************************************************
   at_exit do
-    if $jabber_component.is_connected?
-      $users.each do |user|
-        user['rooms'].each do |room|
-
-          $log.info( "Shutting down room #{room['campfire_room_name']} for user #{user['jabber_id']}" )
-
-          room_jid=nil
-          if room.has_key?('room_jid')
-            room_jid=room['room_jid']
-          else
-            room_jid="#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}"
-          end
-
-          user_jid=nil
-          if room.has_key?('user_jid')
-            user_jid=room['user_jid']
-          else
-            user_jid=user['jabber_id']
-          end
-
-          send_presence( room_jid, user_jid, :unavailable, true, 'none', 'none', 'Campfire server shutting down.', [ '307' ] )
-        end
-      end
-    end
+    jabber_shutdown
   end
 
-  #************************************************
-  # Server Setup
-  #************************************************
-  $jabber_component = Jabber::Component::new(ArsonConfig::JabberComponentName)
-  $jabber_component.connect(ArsonConfig::JabberComponentHost)
-  $jabber_component.auth(ArsonConfig::JabberComponentSecret)
-
-  #************************************************
-  # Actual server code
-  #************************************************
-  setup_jabber_message_callback
-
-  setup_jabber_presence_callback
+  jabber_reset
 
   #************************************************
   # Hang until signal
