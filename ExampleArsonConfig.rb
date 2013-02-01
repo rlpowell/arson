@@ -14,6 +14,10 @@ module ArsonConfig
   # which are put in arson.log.
   LogDir = "/home/rpowell/arson/"
 
+  # Set to an email address if you want want be emailed on severe
+  # errors
+  SystemEmail = nil
+
   # Set to true to see debugging information for all Jabber
   # stanzas.
   JabberDebug = false

@@ -61,6 +61,7 @@ require 'ArsonConfig'
 $jabber_component = nil
 $log = nil
 $users = nil
+$all_exit = false
 
 #**************************************************
 # Support Functions
@@ -70,13 +71,35 @@ $users = nil
 
 # Send stuff to jabber with retries
 def jabber_send( stuff )
+  retries = 5
+
   begin
     $jabber_component.send(stuff)
   rescue Exception => e
-    $log.info( "Couldn't send to jabber due to error: " )
-    $log.info( e )
-    jabber_reset
+    if retries > 0
+      $log.error( "Couldn't send to jabber due to error: " )
+      $log.error( e )
+      $log.error( "Jabber stanza we couldn't send: : #{YAML::dump(stuff)}\n" )
+      $log.error( "Retrying jabber send gently, #{retries}." )
+      retries -= 1
+      sleep 1
+      retry
+    else
+      $log.error( "Couldn't send to jabber due to error: " )
+      $log.error( e )
+      $log.error( "Jabber stanza we couldn't send: : #{YAML::dump(stuff)}\n" )
+      $log.error( "Trying to recover jabber send forcefully" )
+      send_email( "Arson Error", "Couldn't send to jabber" )
+      jabber_reset
+    end
   end
+end
+
+def send_email(subject, message)
+  %x{mailx -s '#{subject}' #{ArsonConfig::SystemEmail} <<EOF
+#{message}
+EOF
+}
 end
 
 # This code is making up for the fact that xmpp4r doesn't know how
@@ -131,11 +154,12 @@ end
 # layouts the user prefers.
 #
 def fix_nicks( room, realuser )
+  # $log.debug( "In fix_nicks: #{YAML.dump(room)}, #{YAML.dump(realuser)}" )
   campfire_room_id = room['campfire_room_id']
 
-  room_info = room['broach_session'].get("room/#{campfire_room_id}.json")
-  $log.debug("fix_nicks: users according to campfire for room #{room['jabber_room_name']} : #{YAML::dump(room_info['room']['users'].map { |u| u['name'] })}")
-  $log.debug("fix_nicks: users according to us for room #{room['jabber_room_name']} : #{YAML::dump(room['jabber_users'])}")
+  room_info = realuser['broach_session'].get("room/#{campfire_room_id}.json")
+  # $log.debug("fix_nicks: users according to campfire for room #{room['jabber_room_name']} : #{YAML::dump(room_info['room']['users'].map { |u| u['name'] })}")
+  # $log.debug("fix_nicks: users according to us for room #{room['jabber_room_name']} : #{YAML::dump(room['jabber_users'])}")
 
   # Check that every room user has a MUC equivalent
   room_info['room']['users'].each do |user|
@@ -168,7 +192,8 @@ def name_to_jabber_nick( name, room )
   if room['jabber_users'].has_key?( name )
     usename = room['jabber_users'][name]
   else
-    $log.info( "In name_to_jabber_nick, unknown nick #{name}." )
+    $log.error( "In name_to_jabber_nick, unknown nick #{name}." )
+    send_email( "Arson Error", "unknown nick #{name}" )
   end
   return slugify_name( usename )
 end
@@ -300,20 +325,21 @@ def send_to_jabber( room, from_campfire_user_name, our_campfire_user_name, msg )
     $log.debug("In send_to_jabber, sending." )
     from = "#{room['jabber_room_name']}@#{ArsonConfig::JabberComponentName}/#{name_to_jabber_nick(from_campfire_user_name, room)}"
     jmess = Jabber::Message.new( room['user_jid'], msg ).set_from( from ).set_type(:groupchat)
-    $log.debug("In send_to_jabber, final version: #{YAML::dump(jmess)}")
+    # $log.debug("In send_to_jabber, final version: #{YAML::dump(jmess)}")
     jabber_send(jmess)
   end
 end
 
 # Sends a message to campfire
-def send_to_campfire( room, msg )
+def send_to_campfire( user, room, msg )
   $log.debug("sending #{msg} to campfire room #{room['campfire_room_name']} from user #{room['user_jid']}")
+  $log.debug( "In send_to_campfire: room details: #{YAML::dump(room)}" )
   if msg =~ /^\/me /
     msg.gsub!(/^\/me (.*)/, '*\1*')
     $log.debug("rewritten; sending #{msg} to campfire room #{room['campfire_room_name']}")
   end
 
-  room['broach_session'].post("room/#{room['campfire_room_id']}/speak", 'message' => {
+  user['broach_session'].post("room/#{room['campfire_room_id']}/speak", 'message' => {
     'type' => 'TextMessage',
     'body' => msg,
   })
@@ -328,23 +354,34 @@ end
 #*************************
 def stay_in_campfire_room( room, user )
   th = Thread.new do
-    attached = false
-    while true
-      begin
-        $log.debug("checking room")
-        #        $log.debug("check 1: #{room['broach_session'].get("presence.json")['rooms'].inspect} should include id #{room['campfire_room_id']}");
-        #        $log.debug("check 2: #{room['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users']} should include id #{user['campfire_id']}");
+    if room.has_key?('old_maint_thread') and room['old_maint_thread'] != nil
+      $log.info( "Killing old stay_in_campfire_room for #{room['campfire_room_name']}" )
+      # There's a small chance that the old copy of this thread is
+      # what kicked us off, so give it a chance to finish.
+      sleep 1
+      room['old_maint_thread'].kill
+    end
 
-        # if ! room['broach_session'].get("presence.json")['rooms'].detect{ |x| x['id'] == room['campfire_room_id']} or
-        #   ! room['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users'].
+    #attached = false
+    while ! $all_exit
+      retries = 5
+      begin
+        $log.debug("stay_in_campfire_room: checking room #{room['campfire_room_name']}")
+        #        $log.debug("check 1: #{user['broach_session'].get("presence.json")['rooms'].inspect} should include id #{room['campfire_room_id']}");
+        #        $log.debug("check 2: #{user['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users']} should include id #{user['campfire_id']}");
+
+        # if ! user['broach_session'].get("presence.json")['rooms'].detect{ |x| x['id'] == room['campfire_room_id']} or
+        #   ! user['broach_session'].get("room/#{room['campfire_room_id']}.json")['room']['users'].
         #   detect{ |x| x['id'] == user['campfire_id']} then
 
-        if attached
-          $log.debug( "Already attachd; not attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
-        else
-          $log.info( "Attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
-          attached = true
-        end
+        #if attached
+        #  $log.debug( "Already attachd; not attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
+        #else
+        #  $log.info( "Attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
+        #  attached = true
+        #end
+
+        $log.info( "stay_in_campfire_room: Attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
 
         # This logs us in to the room.  We re-run it
         # periodically because we seem to fall out otherwise.
@@ -356,45 +393,80 @@ def stay_in_campfire_room( room, user )
         # fixed
 
         # REST here is from the nap egg, which is what broach uses
-        #        $log.debug( "post: #{room['broach_session'].url_for("room/#{room['campfire_room_id']}/join")}, '', #{YAML::dump(room['broach_session'].headers_for(:post))}, #{YAML::dump(room['broach_session'].credentials)})" )
-        REST.post(room['broach_session'].url_for("room/#{room['campfire_room_id']}/join"), '', room['broach_session'].headers_for(:post), room['broach_session'].credentials)
+        #        $log.debug( "post: #{user['broach_session'].url_for("room/#{room['campfire_room_id']}/join")}, '', #{YAML::dump(user['broach_session'].headers_for(:post))}, #{YAML::dump(user['broach_session'].credentials)})" )
+        REST.post(user['broach_session'].url_for("room/#{room['campfire_room_id']}/join"), '', user['broach_session'].headers_for(:post), user['broach_session'].credentials)
         # end
+        
+        $log.debug( "stay_in_campfire_room: Done attaching to room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
 
         # Also check membership, as that sort of thing seems to get
         # lost a fair bit
         fix_nicks( room, user )
 
+        $log.debug( "stay_in_campfire_room: Done fix_nicks for room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
+
         # Make sure the user knows they're still in the room
         send_presence( room['room_jid'], room['user_jid'], nil, true, 'member', 'participant', nil, [ '100', '110', '210' ] )
 
+        $log.debug( "stay_in_campfire_room: Done send_presence for room #{room['campfire_room_name']}, id #{room['campfire_room_id']}, for user #{room['user_jid']}" )
+
         # Restart the room watch thread, cuz it seems to drop
-        # sometimes.
+        # sometimes; restarting the stream effectively does this as
+        # it causes the loop to drop out.
         if room['http_stream']
           begin
-            $log.debug( "In stay_in_campfire_room, doing the loop termination for room #{room['campfire_room_name']}" )
+            $log.debug( "stay_in_campfire_room: doing the stream termination for room #{room['campfire_room_name']}" )
             room['http_stream'].terminate
           rescue SocketError, IOError
             # We don't care about these when we're trying to break
             # the connection.
           end
         else
-          $log.debug( "In stay_in_campfire_room, the campfire stream for #{room['campfire_room_name']} isn't ready" )
+          $log.debug( "stay_in_campfire_room: the campfire stream for #{room['campfire_room_name']} isn't ready for user #{room['user_jid']}" )
         end
 
         sleep 300
-      rescue SocketError
-        $log.error( "Networking problems in stay attached thread for room #{room['campfire_room_name']} with error: " )
-        $log.error( e )
-        exit
-      rescue SystemExit
-        $log.error( "Exit requetsed in stay attached thread for room #{room['campfire_room_name']}." )
+      rescue SocketError => e
+        if retries > 0
+          $log.error( "Networking problems in stay_in_campfire_room thread for #{room['campfire_room_name']}  for user #{room['user_jid']}with error: " )
+          $log.error( e )
+          $log.error( "Retrying gently for networking problems in room thread for #{room['campfire_room_name']} for user #{room['user_jid']}, retry number #{retries}." )
+          retries -= 1
+          sleep 1
+          retry
+        else
+          $log.error( "Networking problems in stay_in_campfire_room thread for room #{room['campfire_room_name']} for user #{room['user_jid']} with error: " )
+          $log.error( e )
+          $log.error( "Trying to recover seriously for networking problems in stay_in_campfire_room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}" )
+          send_email( "Arson Error", "Had networking problems in stay attached thread for room #{room['campfire_room_name']} for user #{room['user_jid']}, tried to recover." )
+          #attached = false
+          setup_campfire_room( room, user )
+        end
+      rescue SystemExit => e
+        $log.error( "Exit requetsed in stay_in_campfire_room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}." )
+        $all_exit = true
         exit
       rescue Exception => e
-        attached = false
-        $log.error( "Error in stay-attached thread for room #{room['campfire_room_name']}: " )
-        $log.error( e )
+        if retries > 0
+          $log.error( "Unknown problem in stay_in_campfire_room thread for #{room['campfire_room_name']} for user #{room['user_jid']} with error: " )
+          $log.error( e )
+          $log.error( "Retrying gently unknown problem in room thread for #{room['campfire_room_name']} for user #{room['user_jid']}, retry number #{retries}." )
+          retries -= 1
+          sleep 1
+          retry
+        else
+          $log.error( "Unknown problem in stay_in_campfire_room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}: " )
+          $log.error( e )
+          $log.error( "Trying to recover seriously for unknown problems in stay_in_campfire_room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}" )
+          send_email( "Arson Error", "Error in stay_in_campfire_room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}"  )
+          #attached = false
+          setup_campfire_room( room, user )
+        end
       end
     end
+
+    $log.error( "While has finished in stay-attached thread for room #{room['campfire_room_name']} for user #{room['user_jid']}" )
+    send_email( "While has finished in stay-attached thread for room #{room['campfire_room_name']} for user #{room['user_jid']}" )
   end
 
   return th
@@ -409,17 +481,25 @@ end
 #************************************************
 def campfire_to_jabber( room, user )
   th = Thread.new do
-    if room['broach_session'] == nil
+    if room.has_key?('old_to_jabber_thread') and room['old_to_jabber_thread'] != nil
+      $log.info( "Killing old campfire_to_jabber for #{room['campfire_room_name']}" )
+      # There's a small chance that the old copy of this thread is
+      # what kicked us off, so give it a chance to finish.
+      room['old_to_jabber_thread'].kill
+    end
+
+    if user['broach_session'] == nil
       $log.error( "Room #{room['campfire_room_name']} doesn't seem to be working in Broach; perhaps the name is wrong?" )
+      send_email( "Arson Error", "Room #{room['campfire_room_name']} doesn't seem to be working in Broach; perhaps the name is wrong?"  )
       break
     end
 
-    $log.debug( "In room thread for #{room['campfire_room_name']}" )
+    $log.info( "Starting room thread for #{room['campfire_room_name']}" )
 
-    while true
-      $log.debug( "In while in room thread #{Thread.current} for #{room['campfire_room_name']}" )
+    retries = 5
 
-      sleep 5
+    while ! $all_exit
+      $log.info( "At the top of the room thread #{Thread.current} for #{room['campfire_room_name']}" )
 
       begin
         $log.debug( "In while in room thread for #{room['campfire_room_name']}, top of begin block" )
@@ -440,12 +520,12 @@ def campfire_to_jabber( room, user )
             "TimestampMessage", "TopicChangeMessage", "UnidleMessage", "UnlockMessage", "TweetMessage"
             if message['body'] != nil and message['user_id'] != nil
               $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending message: #{message['body']}" )
-              campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
+              campfire_user_name=user['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
               send_to_jabber( room, campfire_user_name, user['campfire_name'], message['body'] )
             end
           when "PasteMessage"
             if message['body'] != nil and message['user_id'] != nil
-              campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
+              campfire_user_name=user['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
               paste=message['body']
               trimmed=false
               if user.has_key?('paste_length') and user['paste_length'] != 'all'
@@ -456,7 +536,7 @@ def campfire_to_jabber( room, user )
                 end
               end
 
-              paste_url = room['broach_session'].url_for("room/#{room['campfire_room_id']}/paste/#{message['id']}")
+              paste_url = user['broach_session'].url_for("room/#{room['campfire_room_id']}/paste/#{message['id']}")
 
               # There are various interactions between the user
               # configs paste_url, paste_style, and paste_length, so
@@ -499,10 +579,10 @@ def campfire_to_jabber( room, user )
             end
           when "UploadMessage"
             if message['body'] != nil and message['user_id'] != nil
-              campfire_user_name=room['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
+              campfire_user_name=user['broach_session'].get("users/"+message['user_id'].to_s)['user']['name']
               $log.debug( "In while in room thread for #{room['campfire_room_name']}, sending upload" )
               upload_url ="room/#{room['campfire_room_id']}/messages/#{message['id']}/upload.json"
-              upload_info = room['broach_session'].get(upload_url)
+              upload_info = user['broach_session'].get(upload_url)
               $log.debug( "upload info from #{upload_url}: #{upload_info.inspect}" )
 
               send_to_jabber( room, campfire_user_name, user['campfire_name'], 
@@ -510,25 +590,55 @@ def campfire_to_jabber( room, user )
             end
           when "KickMessage", "LeaveMessage", "JoinMessage", "EnterMessage"
             if message['user_id'] != nil
-              uname = room['broach_session'].get("users/#{message['user_id']}.json")['user']['id']
+              uname = user['broach_session'].get("users/#{message['user_id']}.json")['user']['id']
               fix_nicks( room, user )
             end
           else
-            $log.info( "In while in room thread for #{room['campfire_room_name']}, unknown message type; message: #{message.inspect}" )
+            $log.error( "In while in room thread for #{room['campfire_room_name']} for user #{room['user_jid']}, unknown message type; message: #{message.inspect}" )
+            send_email( "Arson Error", "In while in room thread for #{room['campfire_room_name']} for user #{room['user_jid']}, unknown message type; message: #{message.inspect}" )
           end
         end
-      rescue SocketError
-        $log.info( "Networking problems in room thread for #{room['campfire_room_name']} with error: " )
-        $log.info( e )
-        exit
-      rescue SystemExit
-        $log.info( "Exit received in room thread for #{room['campfire_room_name']}" )
+      rescue SocketError => e
+        if retries > 0
+          $log.error( "Networking problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']} with error: " )
+          $log.error( e )
+          $log.error( "Retrying gently for networking problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']}: #{retries}" )
+          retries -= 1
+          sleep 1
+          retry
+        else
+          $log.error( "Networking problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']} with error: " )
+          $log.error( e )
+          $log.error( "Trying to recover for networking problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']}: #{retries}" )
+          send_email( "Arson Error", "Networking problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']}" )
+          attached = false
+          setup_campfire_room( room, user )
+        end
+      rescue SystemExit => e
+        $log.error( "Exit received in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']}" )
+        $all_exit = true
         exit
       rescue Exception => e
-        $log.info( "detached from room #{room['campfire_room_name']} via error: " )
-        $log.info( e )
+        if retries > 0
+          $log.error( "Unknown problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']} with error: " )
+          $log.error( e )
+          $log.error( "Retrying gently for unknown problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']}: #{retries}" )
+          retries -= 1
+          sleep 1
+          retry
+        else
+          $log.error( "Unknown problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']} with error: " )
+          $log.error( e )
+          $log.error( "Trying to recover for unknown problems in campfire_to_jabber thread for #{room['campfire_room_name']} for user #{room['user_jid']}: #{retries}" )
+          send_email( "Arson Error", "detached from room #{room['campfire_room_name']} for user #{room['user_jid']}" )
+          attached = false
+          setup_campfire_room( room, user )
+        end
       end
     end
+
+    $log.error( "campfire_to_jabber: While has finished in room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}" )
+    send_email( "campfire_to_jabber: While has finished in room thread for room #{room['campfire_room_name']} for user #{room['user_jid']}" )
   end
   return th
 end
@@ -580,16 +690,99 @@ def jabber_reset
   #************************************************
   # Server Setup
   #************************************************
-  $jabber_component = Jabber::Component::new(ArsonConfig::JabberComponentName)
-  $jabber_component.connect(ArsonConfig::JabberComponentHost)
-  $jabber_component.auth(ArsonConfig::JabberComponentSecret)
-
+  begin
+    $jabber_component = Jabber::Component::new(ArsonConfig::JabberComponentName)
+    $jabber_component.connect(ArsonConfig::JabberComponentHost)
+    $jabber_component.auth(ArsonConfig::JabberComponentSecret)
+  rescue Exception => e
+      $log.error( "Error received in jabber_reset: " )
+      $log.error( e )
+      send_email( "Arson Error", "Error received in jabber_reset" )
+      sleep 10
+      $log.error( "Retrying." )
+      retry
+  end
   #************************************************
   # Actual server code
   #************************************************
   setup_jabber_message_callback
 
   setup_jabber_presence_callback
+end
+
+def teardown_campfire_room( room )
+  $log.info( "In teardown_campfire_room: tearing down room #{room['campfire_room_name']} for user #{room['campfire_user_name']}" )
+
+  room['jabber_users'] = Hash.new
+
+  if room.has_key?('maint_thread') and room['maint_thread'] != nil
+    room['old_maint_thread'] = room['maint_thread']
+    room['maint_thread'] = nil
+  end
+
+  if room.has_key?('to_jabber_thread') and room['to_jabber_thread'] != nil
+    room['old_to_jabber_thread'] = room['to_jabber_thread']
+    room['to_jabber_thread'] = nil
+  end
+
+  # Signal that this room is dead
+  room['campfire_room_id'] = nil
+  if room['http_stream']
+    begin
+      room['http_stream'].terminate
+    rescue SocketError, IOError
+      # We don't care about these when we're trying to break
+      # the connection.
+    end
+  end
+end
+
+def setup_campfire_room( room, user )
+  $log.debug( "In setup_campfire_room: #{YAML.dump(room)}, #{YAML.dump(user)}." )
+  
+  teardown_campfire_room( room )
+
+  $log.info( "In setup_campfire_room: setting up room #{room['campfire_room_name']} for user #{room['campfire_user_name']}" )
+
+  # Now that broach is setup, get the user's campfire_id
+  # if we don't already have it.
+  if ! user.has_key?('campfire_id')
+    user['campfire_id'] = user['broach_session'].get("users/me.json")['user']['id']
+    $log.debug( "In setup_campfire_room: usercfid: #{user['campfire_id']}" )
+
+    user['campfire_name'] = user['broach_session'].get("users/me.json")['user']['name']
+    $log.debug( "In setup_campfire_room: usercfname: #{user['campfire_name']}" )
+  end
+
+  room['jabber_users'] = Hash.new
+
+  rooms = user['broach_session'].get('rooms')['rooms']
+  $log.debug( "In setup_campfire_room, rooms: #{YAML.dump(rooms)}" )
+
+  this_room = rooms.find do |attributes|
+    attributes['name'] == room['campfire_room_name']
+  end
+
+  $log.debug( "In setup_campfire_room, this_room: #{YAML.dump(this_room)}" )
+
+  room['campfire_room_id'] = this_room['id']
+
+  $log.debug( "In setup_campfire_room, room id found: #{room['campfire_room_id']}" )
+
+  room['campfire_user_name'] = user['broach_session'].get("users/#{user['campfire_id']}")['user']['name']
+
+  $log.debug( "Final room setup for user #{room['user_jid']}: results: #{YAML::dump(room)}" )
+
+  fix_nicks( room, user )
+
+  # Let the user know they're in
+  send_presence( room['room_jid'],
+                room['user_jid'], nil, true,
+                'member', 'participant', nil, [ '100', '110', '210' ] )
+
+  room['maint_thread'] = stay_in_campfire_room( room, user )
+
+  room['to_jabber_thread'] = campfire_to_jabber( room, user )
 end
 
 def setup_jabber_presence_callback
@@ -614,21 +807,7 @@ def setup_jabber_presence_callback
           $log.info( "User #{from} has left the building." )
 
           user['rooms'].each do |room|
-            $log.info( "Tearing down room #{room['campfire_room_name']} for user #{from}" )
-
-            room['jabber_users'] = nil
-
-            room['broach_session'] = nil
-
-            if room.has_key?('maint_thread') and room['maint_thread'] != nil
-              room['maint_thread'].kill
-            end
-            room['maint_thread'] = nil
-
-            if room.has_key?('to_jabber_thread') and room['to_jabber_thread'] != nil
-              room['to_jabber_thread'].kill
-            end
-            room['to_jabber_thread'] = nil
+            teardown_campfire_room( room )
           end
 
           # Type is nil == available
@@ -637,60 +816,26 @@ def setup_jabber_presence_callback
           user['rooms'].each do |room|
             if room['jabber_room_name'].casecmp( to.gsub(/\@.*/, '') ) == 0
               # We've matched the room; do we already have it?
-              if ! room.has_key?('broach_session') or room['broach_session'] == nil
+#              if ! room.has_key?('campfire_room_id') or room['campfire_room_id'] == nil
+                room['user_jid'] = from
+                room['room_jid'] = to  
                 $log.debug( "Presence received for room #{to}, setting it up now." )
                 # We don't; set it up
-                Broach.settings = {
-                  'account' => ArsonConfig::CampfireDomain.gsub(/\..*/, ''),
-                  'token'   => user['campfire_token'],
-                  'use_ssl' => true
-                }
-
-                # Now that broach is setup, get the user's campfire_id
-                # if we don't already have it.
-                if ! user.has_key?('campfire_id')
-                  user['campfire_id'] = Broach.session.get("users/me.json")['user']['id']
-
-                  user['campfire_name'] = Broach.session.get("users/me.json")['user']['name']
-                end
-
-                room['jabber_users'] = Hash.new
-
-                room['campfire_room_id'] = Broach::Room.find_by_name( room['campfire_room_name'] ).id
-
-                room['broach_session'] = Broach.session
-
-                room['campfire_user_name'] = room['broach_session'].get("users/#{user['campfire_id']}")['user']['name']
-
-                room['user_jid'] = from
-
-                room['room_jid'] = to
-
-                $log.debug( "Final room setup for user #{from}: results: #{YAML::dump(room)}" )
-
-                fix_nicks( room, user )
-
-                # Let the user know they're in
-                send_presence( room['room_jid'],
-                              room['user_jid'], nil, true,
-                              'member', 'participant', nil, [ '100', '110', '210' ] )
-
-                room['maint_thread'] = stay_in_campfire_room( room, user )
-
-                room['to_jabber_thread'] = campfire_to_jabber( room, user )
-              else
-                $log.info( "Presence received for room #{to}, but it needs no setup." )
-
-                fix_nicks( room, user )
-                send_presence( room['room_jid'],
-                              room['user_jid'], nil, true,
-                              'member', 'participant', nil, [ '100', '110', '210' ] )
-              end
+                setup_campfire_room( room, user )
+#              else
+#                $log.info( "Presence received for room #{to}, but it needs no setup." )
+#
+#                fix_nicks( room, user )
+#                send_presence( room['room_jid'],
+#                              room['user_jid'], nil, true,
+#                              'member', 'participant', nil, [ '100', '110', '210' ] )
+#              end
             end
           end
           # Type is something else
         else
           $log.error( "Got a presence of type #{type}, which we don't handle; details: to: #{to}, from: #{from}" )
+          send_email( "Arson Error", "Got a presence of type #{type}, which we don't handle; details: to: #{to}, from: #{from}" )
         end
       end
     end
@@ -732,7 +877,7 @@ def setup_jabber_message_callback
             user['rooms'].each do |room|
               if room['jabber_room_name'].casecmp( to.gsub(/\@.*/, '') ) == 0
                 room_found=true
-                send_to_campfire( room, message.body )
+                send_to_campfire( user, room, message.body )
               end
             end
           end
@@ -744,20 +889,31 @@ def setup_jabber_message_callback
 
         if ! room_found
           $log.error( "Message sent to unknown jabber room #{to}" )
+          send_email( "Arson Error", "Message sent to unknown jabber room #{to}" )
         end
+      elsif type == "error"
+        # Just toss these out; they don't seem to mean anything
+        $log.debug( "Message of weird type '#{type}'; message details: to: #{to}, from: #{from}, body: #{body}" )
       else
         $log.error( "Message of bad type '#{type}'; message details: to: #{to}, from: #{from}, body: #{body}" )
+        send_email( "Arson Error", "Message of bad type '#{type}'; message details: to: #{to}, from: #{from}, body: #{body}" )
       end
-    rescue SocketError
-      $log.info( "Networking problems in jabber message callback with error: " )
-      $log.info( e )
-      exit
-    rescue SystemExit
-      $log.info( "Exit received in jabber message callback" )
+    rescue SocketError => e
+      $log.error( "Networking problems in jabber message callback with error: " )
+      $log.error( e )
+      $log.error( "Trying to recover" )
+      send_email( "Arson Error", "Networking problems in jabber message callback" )
+      jabber_reset
+    rescue SystemExit => e
+      $log.error( "Exit received in jabber message callback" )
+      $all_exit
       exit
     rescue Exception => e
-      $log.info( "Error received in jabber message callback: " )
-      $log.info( e )
+      $log.error( "Error received in jabber message callback: " )
+      $log.error( e )
+      $log.error( "Trying to recover" )
+      send_email( "Arson Error", "Error received in jabber message callback" )
+      jabber_reset
     end
   end
 end
@@ -766,10 +922,10 @@ end
 # Server setup/running
 #************************************************
 Daemons.run_proc('arson',
-                :dir_mode => :normal,
-                :dir => ArsonConfig::LogDir,
-                :monitor => true,
-                :log_output => true ) do
+                 :dir_mode => :normal,
+                 :dir => ArsonConfig::LogDir,
+                 :monitor => true,
+                 :log_output => true ) do
 
   #************************************************
   # Configuration Loading
@@ -787,6 +943,29 @@ Daemons.run_proc('arson',
   end
 
   $users.each do |user|
+    user['broach_session'] = Broach::Session.new( {
+      'account' => ArsonConfig::CampfireDomain.gsub(/\..*/, ''),
+      'token'   => user['campfire_token'],
+      'use_ssl' => true
+    } )
+
+    retries = 5
+
+    $log.debug( "In main setup: session class: #{user['broach_session'].class}" )
+    $log.debug( "In main setup: rooms test: #{user['broach_session'].get('rooms')}" )
+
+    while user['broach_session'].class != Broach::Session or user['broach_session'].get('rooms').length < 1
+      $log.info( "In main setup, having trouble setting up Broach for #{user['jabber_id']}" )
+
+      sleep 5
+
+      user['broach_session'] = Broach::Session.new( {
+        'account' => ArsonConfig::CampfireDomain.gsub(/\..*/, ''),
+        'token'   => user['campfire_token'],
+        'use_ssl' => true
+      } )
+    end
+
     user['rooms'].map! do |roomname|
       # Turn the room from a simple string into a hash
       room = Hash.new
